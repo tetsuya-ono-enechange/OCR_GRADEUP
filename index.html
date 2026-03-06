@@ -44,4 +44,198 @@
         
         .filename { font-size: 0.9rem; color: #555; margin-bottom: 10px; word-break: break-all; font-weight: bold; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         label.input-label { font-size: 0.8rem; font-weight: bold; color: #666; display: block; margin-bottom: 4px; }
-        input[type="text"] { width: 100%; padding: 10px; border:
+        input[type="text"] { width: 100%; padding: 10px; border: 2px solid var(--border); border-radius: 4px; font-size: 1.1rem; box-sizing: border-box; }
+        input[type="text"].found { border-color: #28a745; background: #f0fdf4; font-weight: bold; color: #155724; }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <h2 style="margin-top: 0; color: var(--primary);">📑 検針票 一括読み取りツール (画像 / PDF対応)</h2>
+        <p style="font-size: 0.95rem; color: #555;">複数のファイルを下の枠にドラッグ＆ドロップするか、クリックして選択してください。</p>
+        
+        <div class="upload-area" id="dropZone" onclick="document.getElementById('fileInput').click()">
+            <div style="font-size: 1.2rem; font-weight: bold; margin-bottom: 15px; color: var(--primary); text-align: center;">
+                <span style="font-size: 2rem; display: block; margin-bottom: 8px;">📁</span>
+                ここをクリックしてファイルを選択<br>
+                <span style="font-size: 0.9rem; color: #666; font-weight: normal;">（またはドラッグ＆ドロップ）</span>
+            </div>
+            <div style="font-size: 0.85rem; color: #555; background: #fff; padding: 6px 18px; border-radius: 20px; border: 1px solid #ccc;">
+                対応形式: JPG, PNG, PDF
+            </div>
+        </div>
+        <input type="file" id="fileInput" multiple accept="image/*, application/pdf">
+    </div>
+
+    <div id="results"></div>
+
+    <script>
+        // ★提供されたAPIキー
+        const API_KEY = 'AIzaSyAAtc3_OIUQOCFbLaW6KoOhH0CUhfqMxVw';
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+
+        const fileInput = document.getElementById('fileInput');
+        const dropZone = document.getElementById('dropZone');
+        const resultsContainer = document.getElementById('results');
+
+        // ドラッグ＆ドロップイベント
+        dropZone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            dropZone.classList.add('dragover');
+        });
+        dropZone.addEventListener('dragleave', (e) => {
+            e.preventDefault();
+            dropZone.classList.remove('dragover');
+        });
+        dropZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dropZone.classList.remove('dragover');
+            const files = Array.from(e.dataTransfer.files);
+            handleFiles(files);
+        });
+
+        // クリックでのファイル選択
+        fileInput.addEventListener('change', (e) => {
+            const files = Array.from(e.target.files);
+            handleFiles(files);
+            fileInput.value = ''; 
+        });
+
+        function handleFiles(files) {
+            if (files.length === 0) return;
+            for (const file of files) {
+                if (file.type.startsWith('image/') || file.type === 'application/pdf') {
+                    createCardAndProcess(file);
+                }
+            }
+        }
+
+        async function createCardAndProcess(file) {
+            const card = document.createElement('div');
+            card.className = 'card';
+            const fileId = 'file_' + Math.random().toString(36).substr(2, 9);
+            
+            card.innerHTML = `
+                <div class="filename" title="${file.name}">📄 ${file.name}</div>
+                <img class="preview-img" id="img_${fileId}">
+                <div class="status loading" id="status_${fileId}">⏳ 処理準備中...</div>
+                <div>
+                    <label class="input-label">供給地点特定番号 (22桁)</label>
+                    <input type="text" id="input_${fileId}" placeholder="自動入力待ち...">
+                </div>
+            `;
+            resultsContainer.prepend(card);
+
+            const statusEl = card.querySelector(`#status_${fileId}`);
+            const inputEl = card.querySelector(`#input_${fileId}`);
+            const imgEl = card.querySelector(`#img_${fileId}`);
+
+            try {
+                let base64Image = '';
+                if (file.type === 'application/pdf') {
+                    statusEl.innerText = "⏳ PDFを画像に変換中...";
+                    base64Image = await convertPdfToBase64(file);
+                } else {
+                    base64Image = await toBase64(file);
+                }
+
+                imgEl.src = base64Image;
+
+                statusEl.innerText = "☁️ Google Cloudで解析中...";
+                const cleanBase64 = base64Image.split(',')[1];
+
+                const response = await fetch(`https://vision.googleapis.com/v1/images:annotate?key=${API_KEY}`, {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        requests: [{
+                            image: { content: cleanBase64 },
+                            features: [{ type: 'DOCUMENT_TEXT_DETECTION' }]
+                        }]
+                    })
+                });
+
+                const data = await response.json();
+
+                if (data.error) throw new Error(data.error.message);
+
+                const result = data.responses[0];
+                if (result && result.fullTextAnnotation) {
+                    const text = result.fullTextAnnotation.text;
+                    
+                    // ==========================================
+                    // 🎯 抽出ロジック（誤認識防止の強化版）
+                    // ==========================================
+                    let foundNumber = null;
+
+                    // 1. フォーマット通り（2桁-4桁-4桁-4桁-4桁-4桁）のものを最優先で探す
+                    // （途中に半角スペースが混ざっていても許容する柔軟な正規表現）
+                    const exactMatch = text.match(/\d{2}\s*-\s*\d{4}\s*-\s*\d{4}\s*-\s*\d{4}\s*-\s*\d{4}\s*-\s*\d{4}/);
+                    
+                    if (exactMatch) {
+                        // 見つかったらハイフンやスペースを除去して22桁にする
+                        foundNumber = exactMatch[0].replace(/[\s-]/g, '');
+                    } else {
+                        // 2. ハイフンがない場合、「供給地点」というキーワードの近くにある22桁を探す
+                        const cleanText = text.replace(/[\s\n-]/g, ''); // 空白やハイフンをすべて除去
+                        const keywordMatch = cleanText.match(/供給地点.*?(\d{22})/);
+                        
+                        if (keywordMatch) {
+                            foundNumber = keywordMatch[1];
+                        } else {
+                            // 3. 最後の砦：他の数字とくっついていない、単独で存在する22桁の数字を探す
+                            const isolatedMatch = cleanText.match(/(?<!\d)\d{22}(?!\d)/);
+                            if (isolatedMatch) {
+                                foundNumber = isolatedMatch[0];
+                            }
+                        }
+                    }
+
+                    // 画面への反映処理
+                    if (foundNumber) {
+                        inputEl.value = foundNumber;
+                        inputEl.classList.add('found');
+                        statusEl.className = 'status success';
+                        statusEl.innerText = "✅ 抽出成功";
+                    } else {
+                        statusEl.className = 'status error';
+                        statusEl.innerText = "⚠️ 22桁の番号が見つかりません";
+                        inputEl.placeholder = "手動で入力してください";
+                    }
+
+                } else {
+                    throw new Error("文字が検出されませんでした");
+                }
+
+            } catch (err) {
+                statusEl.className = 'status error';
+                statusEl.innerText = "❌ エラー: " + err.message;
+            }
+        }
+
+        // 画像をBase64に変換する補助関数
+        const toBase64 = file => new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.readAsDataURL(file);
+            reader.onload = () => resolve(reader.result);
+            reader.onerror = error => reject(error);
+        });
+
+        // PDFの1ページ目を画像に変換する補助関数
+        async function convertPdfToBase64(file) {
+            const arrayBuffer = await file.arrayBuffer();
+            const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+            const page = await pdf.getPage(1);
+            
+            const scale = 1.5; 
+            const viewport = page.getViewport({ scale: scale });
+            const canvas = document.createElement('canvas');
+            const context = canvas.getContext('2d');
+            canvas.height = viewport.height;
+            canvas.width = viewport.width;
+
+            await page.render({ canvasContext: context, viewport: viewport }).promise;
+            return canvas.toDataURL('image/jpeg', 0.8);
+        }
+    </script>
+</body>
+</html>
