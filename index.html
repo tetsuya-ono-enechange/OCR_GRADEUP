@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>検針票OCR - 一括処理ツール</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+    <style>
+        :root { --primary: #1a73e8; --bg: #f8f9fa; --border: #dadce0; }
+        body { font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif; background: var(--bg); color: #333; padding: 20px; max-width: 1000px; margin: 0 auto; }
+        .header { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; text-align: center; }
+        
+        /* ファイルアップロードエリア */
+        .upload-area { border: 2px dashed var(--primary); padding: 40px 20px; background: #e8f0fe; border-radius: 8px; cursor: pointer; transition: 0.3s; }
+        .upload-area:hover { background: #d2e3fc; }
+        input[type="file"] { display: none; }
+        
+        /* 結果のカードグリッド表示 */
+        #results { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px; margin-top: 20px; }
+        .card { background: white; border: 1px solid var(--border); border-radius: 8px; padding: 15px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); display: flex; flex-direction: column; }
+        
+        /* サムネイル画像 */
+        .preview-img { width: 100%; height: 180px; object-fit: contain; background: #eee; border-radius: 4px; margin-bottom: 10px; border: 1px solid #ccc; }
+        
+        /* ステータスと入力欄 */
+        .status { font-size: 0.85rem; font-weight: bold; margin-bottom: 10px; padding: 4px 8px; border-radius: 4px; text-align: center; }
+        .status.loading { background: #fff3cd; color: #856404; }
+        .status.success { background: #d4edda; color: #155724; }
+        .status.error { background: #f8d7da; color: #721c24; }
+        
+        .filename { font-size: 0.9rem; color: #555; margin-bottom: 10px; word-break: break-all; font-weight: bold; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        label { font-size: 0.8rem; font-weight: bold; color: #666; }
+        input[type="text"] { width: 100%; padding: 8px; border: 2px solid var(--border); border-radius: 4px; font-size: 1rem; margin-top: 4px; box-sizing: border-box; }
+        input[type="text"].found { border-color: #28a745; background: #f0fdf4; font-weight: bold;}
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <h2>📑 検針票 一括読み取りツール (画像 / PDF対応)</h2>
+        <p>複数のファイルを下の枠にドラッグ＆ドロップするか、クリックして選択してください。</p>
+        
+        <label class="upload-area" for="fileInput">
+            <strong>📁 ここをクリックしてファイルを選択（複数選択可）</strong>
+            <br><span style="font-size: 0.8rem; color: #666;">対応形式: JPG, PNG, PDF</span>
+        </label>
+        <input type="file" id="fileInput" multiple accept="image/*, application/pdf">
+    </div>
+
+    <div id="results"></div>
+
+    <script>
+        // ★ 提供されたAPIキーを設定
+        const API_KEY = 'AIzaSyAAtc3_OIUQOCFbLaW6KoOhH0CUhfqMxVw';
+        
+        // PDF.jsのワーカーを設定（PDF読み込みに必須）
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+
+        const fileInput = document.getElementById('fileInput');
+        const resultsContainer = document.getElementById('results');
+
+        // ファイルが選択された時の処理
+        fileInput.addEventListener('change', async (e) => {
+            const files = Array.from(e.target.files);
+            if (files.length === 0) return;
+
+            // ファイルごとに処理ループ
+            for (const file of files) {
+                createCardAndProcess(file);
+            }
+            // 同じファイルを再度選べるようにリセット
+            fileInput.value = ''; 
+        });
+
+        // 1つのファイル用のカード（UI）を作り、OCR処理を開始する関数
+        async function createCardAndProcess(file) {
+            // 1. UI（カード）の作成
+            const card = document.createElement('div');
+            card.className = 'card';
+            
+            const fileId = 'file_' + Math.random().toString(36).substr(2, 9);
+            
+            card.innerHTML = `
+                <div class="filename" title="${file.name}">📄 ${file.name}</div>
+                <img class="preview-img" id="img_${fileId}">
+                <div class="status loading" id="status_${fileId}">⏳ 解析中...</div>
+                <div>
+                    <label>供給地点特定番号 (22桁)</label>
+                    <input type="text" id="input_${fileId}" placeholder="自動入力待ち...">
+                </div>
+            `;
+            resultsContainer.prepend(card); // 新しいものを上に追加
+
+            const statusEl = card.querySelector(`#status_${fileId}`);
+            const inputEl = card.querySelector(`#input_${fileId}`);
+            const imgEl = card.querySelector(`#img_${fileId}`);
+
+            try {
+                // 2. ファイルをBase64画像に変換 (PDFか画像かで分岐)
+                let base64Image = '';
+                if (file.type === 'application/pdf') {
+                    statusEl.innerText = "⏳ PDFを画像化中...";
+                    base64Image = await convertPdfToBase64(file);
+                } else {
+                    base64Image = await toBase64(file);
+                }
+
+                // サムネイル表示
+                imgEl.src = base64Image;
+
+                // 3. Vision APIへ送信
+                statusEl.innerText = "☁️ Google Cloudで解析中...";
+                const cleanBase64 = base64Image.split(',')[1]; // DataURLのヘッダーを削除
+
+                const response = await fetch(`https://vision.googleapis.com/v1/images:annotate?key=${API_KEY}`, {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        requests: [{
+                            image: { content: cleanBase64 },
+                            features: [{ type: 'DOCUMENT_TEXT_DETECTION' }]
+                        }]
+                    })
+                });
+
+                const data = await response.json();
+
+                if (data.error) throw new Error(data.error.message);
+
+                const result = data.responses[0];
+                if (result && result.fullTextAnnotation) {
+                    const text = result.fullTextAnnotation.text;
+                    const cleanText = text.replace(/[\s\n-]/g, ''); // 空白やハイフンを除去
+                    const match = cleanText.match(/\d{22}/);
+
+                    if (match) {
+                        inputEl.value = match[0];
+                        inputEl.classList.add('found');
+                        statusEl.className = 'status success';
+                        statusEl.innerText = "✅ 抽出成功";
+                    } else {
+                        statusEl.className = 'status error';
+                        statusEl.innerText = "⚠️ 22桁の番号が見つかりません";
+                        inputEl.placeholder = "手動で入力してください";
+                    }
+                } else {
+                    throw new Error("文字が検出されませんでした");
+                }
+
+            } catch (err) {
+                statusEl.className = 'status error';
+                statusEl.innerText = "❌ エラー: " + err.message;
+            }
+        }
+
+        // --- 補助関数：画像をBase64に変換 ---
+        const toBase64 = file => new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.readAsDataURL(file);
+            reader.onload = () => resolve(reader.result);
+            reader.onerror = error => reject(error);
+        });
+
+        // --- 補助関数：PDFの1ページ目を画像(Base64)に変換 ---
+        async function convertPdfToBase64(file) {
+            const arrayBuffer = await file.arrayBuffer();
+            const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+            const page = await pdf.getPage(1); // 1ページ目を取得
+            
+            // 描画用のCanvasを作成（解像度を少し高めにして文字潰れを防ぐ）
+            const scale = 1.5; 
+            const viewport = page.getViewport({ scale: scale });
+            const canvas = document.createElement('canvas');
+            const context = canvas.getContext('2d');
+            canvas.height = viewport.height;
+            canvas.width = viewport.width;
+
+            // PDFをCanvasに描画
+            await page.render({ canvasContext: context, viewport: viewport }).promise;
+            
+            // JPEG画像としてBase64出力
+            return canvas.toDataURL('image/jpeg', 0.8);
+        }
+    </script>
+</body>
+</html>
